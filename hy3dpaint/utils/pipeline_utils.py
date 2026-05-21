@@ -68,7 +68,32 @@ class ViewProcessor:
         total_viewed_tri_idxs = set()
         total_viewed_area = 0.0
 
-        for idx in range(6):
+        # AMD ROCm low-VRAM (empirical):
+        # candidate_camera_azims default = [0, 90, 180, 270, 0, 180] (textureGenPipeline.py:57)
+        # The "front" of a Hunyuan3D-2.1 mesh depends on the pre-texture pipeline:
+        #   - WITHOUT the pymeshlab cleanup: front = azim=180/elev=0 (index 2)
+        #   - WITH the pymeshlab cleanup (uncommented in _generation_all_impl): Y/Z axis
+        #     swap via the .ply roundtrip => front = azim=0/elev=0 (index 0)
+        # Our pipeline applies the cleanup, so index 0 is the correct front.
+        if max_selected_view_num >= 6:
+            base_indices = list(range(6))  # upstream behavior bit-identical
+        elif max_selected_view_num == 1:
+            # Force front view (azim=0, elev=0) = index 0 dans la default candidate
+            front_idx = None
+            for i, (azim, elev) in enumerate(zip(candidate_camera_azims, candidate_camera_elevs)):
+                if azim == 0 and elev == 0:
+                    front_idx = i
+                    break
+            base_indices = [front_idx] if front_idx is not None else [0]
+        else:
+            # Multi-view (2-5) : tri par weight desc (comportement v1)
+            base_indices = sorted(
+                range(6),
+                key=lambda i: candidate_view_weights[i],
+                reverse=True,
+            )[:max_selected_view_num]
+
+        for idx in base_indices:
             selected_camera_elevs.append(candidate_camera_elevs[idx])
             selected_camera_azims.append(candidate_camera_azims[idx])
             selected_view_weights.append(candidate_view_weights[idx])
@@ -105,6 +130,17 @@ class ViewProcessor:
                 break
 
         self.render.set_default_render_resolution(original_resolution)
+
+        # Labelled log for sanity-check of view selection
+        # (front-only expected: [{'azim': 0, 'elev': 0, 'weight': 1}])
+        print("[view_selection]", [
+            {"azim": azim, "elev": elev, "weight": weight}
+            for elev, azim, weight in zip(
+                selected_camera_elevs,
+                selected_camera_azims,
+                selected_view_weights,
+            )
+        ])
 
         return selected_camera_elevs, selected_camera_azims, selected_view_weights
 

@@ -53,6 +53,10 @@ class Hunyuan3DPaintConfig:
         self.bake_exp = 4
         self.merge_method = "fast"
 
+        # AMD ROCm low-VRAM: mirror_back = duplicate the front image (H-flip) onto the back
+        # camera before bake. Diffusion VRAM cost identical to 1 view.
+        self.mirror_back = False
+
         # view selection
         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
         self.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
@@ -162,11 +166,28 @@ class Hunyuan3DPaintPipeline:
             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
 
         ###########  Bake  ##########
-        for i in range(len(enhance_images)):
+        # UPSTREAM BUG FIX: original code used `len(enhance_images)` which equals 2
+        # (nb of dict keys "albedo"+"mr"), not the nb of views. Breaks with max_num_view<2.
+        # Use len of the actual view list instead.
+        for i in range(len(enhance_images["albedo"])):
             enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
                 (self.config.render_size, self.config.render_size)
             )
             enhance_images["mr"][i] = enhance_images["mr"][i].resize((self.config.render_size, self.config.render_size))
+
+        # AMD ROCm low-VRAM: mirror_back duplicates the front image (H-flip) onto the back
+        # camera BEFORE bake. Diffusion only cost 1 view.
+        # The H-flip preserves chirality when viewing the mesh from behind.
+        if getattr(self.config, 'mirror_back', False) and len(selected_camera_elevs) == 1:
+            front_albedo = enhance_images["albedo"][0]
+            front_mr = enhance_images["mr"][0]
+            enhance_images["albedo"].append(front_albedo.transpose(Image.FLIP_LEFT_RIGHT))
+            enhance_images["mr"].append(front_mr.transpose(Image.FLIP_LEFT_RIGHT))
+            selected_camera_elevs = list(selected_camera_elevs) + [0]
+            selected_camera_azims = list(selected_camera_azims) + [180]
+            selected_view_weights = list(selected_view_weights) + [1.0]
+            print(f"[mirror_back] duplicated front view onto back cam (azim=180), total views for bake: {len(enhance_images['albedo'])}")
+
         texture, mask = self.view_processor.bake_from_multiview(
             enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights
         )
