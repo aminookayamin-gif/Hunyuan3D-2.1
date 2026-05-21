@@ -13,18 +13,47 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 from setuptools import setup, find_packages
+import os
 import torch
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 # build custom rasterizer
+#
+# AMD ROCm support (amd-rocm fork): on a ROCm-built PyTorch (torch.version.hip set),
+# pick the .hip / *_hip.* sources committed in this fork instead of the upstream .cu sources.
+# On NVIDIA CUDA PyTorch (torch.version.hip is None), keep the upstream .cu sources unchanged.
+# The HIP sources were generated from the CUDA ones via `hipify-perl -inplace` and are kept
+# committed so a fresh AMD machine can rebuild without re-running hipify.
+
+KERNEL_DIR = "lib/custom_rasterizer_kernel"
+
+
+def _is_rocm() -> bool:
+    """True if PyTorch was built against ROCm (i.e. AMD GPU stack)."""
+    return getattr(torch.version, "hip", None) is not None
+
+
+if _is_rocm() and os.path.exists(os.path.join(KERNEL_DIR, "rasterizer_gpu.hip")):
+    sources = [
+        os.path.join(KERNEL_DIR, "rasterizer_hip.cpp"),
+        os.path.join(KERNEL_DIR, "grid_neighbor_hip.cpp"),
+        os.path.join(KERNEL_DIR, "rasterizer_gpu.hip"),
+    ]
+    print("[custom_rasterizer/setup.py] ROCm PyTorch detected — using HIP sources.")
+else:
+    sources = [
+        os.path.join(KERNEL_DIR, "rasterizer.cpp"),
+        os.path.join(KERNEL_DIR, "grid_neighbor.cpp"),
+        os.path.join(KERNEL_DIR, "rasterizer_gpu.cu"),
+    ]
+    if not _is_rocm():
+        print("[custom_rasterizer/setup.py] CUDA PyTorch detected — using upstream CUDA sources.")
+    else:
+        print("[custom_rasterizer/setup.py] ROCm PyTorch but HIP sources missing — falling back to CUDA sources (build will likely fail).")
 
 custom_rasterizer_module = CUDAExtension(
     "custom_rasterizer_kernel",
-    [
-        "lib/custom_rasterizer_kernel/rasterizer.cpp",
-        "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
-        "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
-    ],
+    sources,
 )
 
 setup(
