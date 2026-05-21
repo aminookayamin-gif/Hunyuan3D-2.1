@@ -98,8 +98,17 @@ class multiviewDiffusionNet:
         kwargs["images_position"] = position_image
 
         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+            # AMD ROCm low-VRAM: DINO (dinov2-giant ~1 GB fp16) is used ONCE
+            # for feature extraction, then sits in VRAM during the entire denoise unused.
+            # Offload to CPU right after extraction to free ~1 GB peak. No quality impact:
+            # features are already computed and kept on the execution device.
+            self.dino_v2.to(self.device)
             dino_hidden_states = self.dino_v2(input_images[0])
+            dino_hidden_states = dino_hidden_states.to(self.pipeline._execution_device)
             kwargs["dino_hidden_states"] = dino_hidden_states
+            self.dino_v2.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         sync_condition = None
 

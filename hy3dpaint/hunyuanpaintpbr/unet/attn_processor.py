@@ -12,6 +12,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -542,9 +543,28 @@ class AttnCore:
             query, key = apply_rope_fn(query, key, head_dim, **kwargs)
 
         # Compute attention
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        # AMD ROCm low-VRAM: chunked SDPA on query dim to reduce VRAM peak.
+        # ROCm 6.3 has no FLASH/EFFICIENT kernel for this 4D shape, only Math kernel works
+        # but materializes QK^T entirely = 1.41-5.62 GB peak transitoire -> OOM on 20 GB.
+        # Chunking query (keeping K/V full) preserves cross-view coordination, only reduces
+        # the peak of the attention computation. Activate via env var HY3D_SDPA_QUERY_CHUNK.
+        # Math identique modulo erreurs numeriques 1e-5 (softmax recompute per chunk).
+        chunk_size = int(os.environ.get("HY3D_SDPA_QUERY_CHUNK", "0"))
+        if chunk_size > 0 and query.shape[-2] > chunk_size:
+            hidden_states_parts = []
+            for start in range(0, query.shape[-2], chunk_size):
+                query_chunk = query[..., start:start + chunk_size, :]
+                hidden_states_parts.append(
+                    F.scaled_dot_product_attention(
+                        query_chunk, key, value,
+                        attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
+                    )
+                )
+            hidden_states = torch.cat(hidden_states_parts, dim=-2)
+        else:
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
 
         return hidden_states, residual, input_ndim, shape_info, batch_size, attn.heads, head_dim
 

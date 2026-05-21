@@ -962,12 +962,22 @@ class UNet2p5DConditionModel(torch.nn.Module):
         if "cache" not in cached_condition:
             cached_condition["cache"] = {}
 
-        sample = [sample]
+        # Manual offload safety fix: force all tensors onto the UNet device
+        # before cat. Without this, the manual text_encoder.to("cpu") offload upsets
+        # the Diffusers device map, which may put the latent sample on CPU while the
+        # VAE embeddings stay on CUDA => RuntimeError "found at least two devices".
+        # The patch does NOT change any value, only ensures all tensors share a device.
+        target_device = next(self.unet.parameters()).device
+        if sample.device != target_device:
+            sample = sample.to(target_device)
+        sample_parts = [sample]
         if "embeds_normal" in cached_condition:
-            sample.append(cached_condition["embeds_normal"].unsqueeze(1).repeat(1, N_pbr, 1, 1, 1, 1))
+            embeds_normal = cached_condition["embeds_normal"].to(device=target_device, dtype=sample.dtype)
+            sample_parts.append(embeds_normal.unsqueeze(1).repeat(1, N_pbr, 1, 1, 1, 1))
         if "embeds_position" in cached_condition:
-            sample.append(cached_condition["embeds_position"].unsqueeze(1).repeat(1, N_pbr, 1, 1, 1, 1))
-        sample = torch.cat(sample, dim=-3)
+            embeds_position = cached_condition["embeds_position"].to(device=target_device, dtype=sample.dtype)
+            sample_parts.append(embeds_position.unsqueeze(1).repeat(1, N_pbr, 1, 1, 1, 1))
+        sample = torch.cat(sample_parts, dim=-3)
 
         sample = rearrange(sample, "b n_pbr n c h w -> (b n_pbr n) c h w")
 
