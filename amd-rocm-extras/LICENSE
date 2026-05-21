@@ -1,0 +1,78 @@
+MIT License
+
+Copyright (c) 2026 Amin (@aminookayamin-gif)
+
+================================================================================
+SCOPE OF THIS LICENSE
+================================================================================
+
+This MIT license covers ONLY the original additions that I authored from scratch
+for the AMD ROCm low-VRAM port of Hunyuan3D-2.1:
+
+  Wholly original files (entire file is mine):
+    - amd-rocm-extras/run_texture.py
+    - amd-rocm-extras/launch_hunyuan_unified.sh
+    - amd-rocm-extras/launch_texture.sh
+    - amd-rocm-extras/README.md
+    - amd-rocm-extras/LICENSE          (this file)
+    - amd_rocm_patches.py              (helper module at repo root)
+    - README_AMD_ROCM.md
+    - PORTING_GUIDE.md
+    - requirements_amd.txt             (my pinned dependency selection)
+    - requirements_texture.txt         (my pinned dependency selection)
+
+  My modifications inside otherwise upstream-licensed files:
+    The patch chunks (additions, deletions, edits) I introduced in:
+      gradio_app.py
+      hy3dpaint/utils/multiview_utils.py
+      hy3dpaint/utils/pipeline_utils.py
+      hy3dpaint/textureGenPipeline.py
+      hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
+      hy3dpaint/hunyuanpaintpbr/unet/modules.py
+      hy3dpaint/custom_rasterizer/setup.py
+    are released under MIT, but ONLY my patch portions — not the surrounding
+    upstream code. The combined files as a whole remain subject to the
+    Tencent Hunyuan 3D 2.1 Community License Agreement (see the repository-root
+    LICENSE file). Anyone using these files must comply with both licenses.
+
+  Derivative HIP sources:
+    The files
+      hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/grid_neighbor_hip.cpp
+      hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_gpu.hip
+      hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_hip.cpp
+      hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer_hip.h
+    were generated from upstream Tencent CUDA sources using `hipify-perl -inplace`.
+    They are mechanical translations of Tencent code and therefore derivative works.
+    Any original adjustments I made to them are released under MIT, but the
+    underlying translated structure inherits from the original CUDA sources and
+    remains subject to the Tencent Hunyuan 3D 2.1 Community License Agreement.
+
+  Hunyuan3D-2.1 itself:
+    The original Hunyuan3D-2.1 source code, weights, configuration, datasets,
+    and assets remain the property of Tencent and are licensed under the
+    "Tencent Hunyuan 3D 2.1 Community License Agreement". See LICENSE and
+    Notice.txt at the repository root for the full upstream license terms.
+    This MIT license does NOT relicense, redistribute, or modify any of the
+    upstream Tencent code or weights.
+
+================================================================================
+MIT LICENSE TEXT
+================================================================================
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

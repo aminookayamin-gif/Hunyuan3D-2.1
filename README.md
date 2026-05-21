@@ -1,3 +1,8 @@
+> **Unofficial low-VRAM fork of Hunyuan3D-2.1 — AMD ROCm primary target, NVIDIA likely benefits too. 6-view PBR texture observed at ~10.5 GB VRAM peak on RX 7900 XT (vs 21+ GB upstream). No quality loss, just time adaptation — math identical; the chunked-SDPA dial trades a bit of attention time for VRAM headroom. See [README_AMD_ROCM.md](README_AMD_ROCM.md) and [PORTING_GUIDE.md](PORTING_GUIDE.md).**
+>
+> Original upstream: [Tencent-Hunyuan/Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1). I am not the upstream author or maintainer. The upstream README is preserved in full below.
+>
+> ---
 
 <p align="center">
   <img src="assets/images/teaser.jpg">
