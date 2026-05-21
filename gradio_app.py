@@ -28,10 +28,12 @@ except Exception as e:
     print(f"Warning: Failed to apply torchvision fix: {e}")
 
 
+import gc
 import os
 import random
 import shutil
 import subprocess
+import threading
 import time
 from glob import glob
 from pathlib import Path
@@ -46,11 +48,30 @@ import uuid
 import numpy as np
 
 from hy3dshape.utils import logger
-from hy3dpaint.convert_utils import create_glb_with_pbr_materials
+try:
+    from hy3dpaint.convert_utils import create_glb_with_pbr_materials
+    HAS_TEX_CONVERT = True
+except Exception as _e:
+    print(f"[shape-only] hy3dpaint.convert_utils unavailable ({_e}); texture export disabled.")
+    HAS_TEX_CONVERT = False
+    def create_glb_with_pbr_materials(*args, **kwargs):
+        raise RuntimeError("Texture pipeline disabled (hy3dpaint requires bpy). Use Gen Shape only.")
 
 
 MAX_SEED = 1e7
 ENV = "Local" # "Huggingface"
+
+# AMD ROCm lifecycle helpers extracted into amd_rocm_patches.py.
+# _generation_lock serialise les clicks (no gradio .queue()).
+# TEXTURE_VENV_PYTHON pointe le venv texture Py3.11 (bpy).
+# _load_shape_worker / _ensure_shape_loaded / _release_torch_memory : shape pipeline lifecycle.
+from amd_rocm_patches import (
+    _generation_lock,
+    TEXTURE_VENV_PYTHON,
+    _load_shape_worker,
+    _ensure_shape_loaded,
+    _release_torch_memory,
+)
 if ENV == 'Huggingface':
     """
     Setup environment for running on Huggingface platform.
@@ -229,6 +250,10 @@ def _gen_shape(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
+    # AMD ROCm low-VRAM: lazy reload du shape pipeline si _generation_all_impl l'a release apres
+    # le subprocess texture precedent (lazy pour eviter le pic RAM qui faisait OOM kernel).
+    global i23d_worker
+    i23d_worker = _ensure_shape_loaded(i23d_worker, args)
     if not MV_MODE and image is None and caption is None:
         raise gr.Error("Please provide either a caption or an image.")
     if MV_MODE:
@@ -322,7 +347,9 @@ def _gen_shape(
     main_image = image if not MV_MODE else image['front']
     return mesh, main_image, save_folder, stats, seed
 
-@spaces.GPU(duration=60)
+# _load_shape_worker moved to amd_rocm_patches.py
+
+
 def generation_all(
     caption=None,
     image=None,
@@ -338,6 +365,42 @@ def generation_all(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
+    # AMD ROCm low-VRAM: serialize concurrent clicks (no gradio .queue() in app).
+    with _generation_lock:
+        return _generation_all_impl(
+            caption=caption,
+            image=image,
+            mv_image_front=mv_image_front,
+            mv_image_back=mv_image_back,
+            mv_image_left=mv_image_left,
+            mv_image_right=mv_image_right,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            octree_resolution=octree_resolution,
+            check_box_rembg=check_box_rembg,
+            num_chunks=num_chunks,
+            randomize_seed=randomize_seed,
+        )
+
+@spaces.GPU(duration=60)
+def _generation_all_impl(
+    caption=None,
+    image=None,
+    mv_image_front=None,
+    mv_image_back=None,
+    mv_image_left=None,
+    mv_image_right=None,
+    steps=50,
+    guidance_scale=7.5,
+    seed=1234,
+    octree_resolution=256,
+    check_box_rembg=False,
+    num_chunks=200000,
+    randomize_seed: bool = False,
+):
+    # AMD ROCm low-VRAM: global needed for del + reassign of i23d_worker (cf _load_shape_worker docstring).
+    global i23d_worker
     start_time_0 = time.time()
     mesh, image, save_folder, stats, seed = _gen_shape(
         caption,
@@ -360,36 +423,98 @@ def generation_all(
     print(path)
     print('='*40)
 
-    # tmp_time = time.time()
-    # mesh = floater_remove_worker(mesh)
-    # mesh = degenerate_face_remove_worker(mesh)
-    # logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
-    # stats['time']['postprocessing'] = time.time() - tmp_time
-
+    # Re-enable the upstream pre-texture cleanup before the texture subprocess.
+    # Sans ce cleanup, le white_mesh sort avec des flotants (petits bouts isoles), texture
+    # applique dessus, et le bouton Transform "export with texture" ne pouvait pas les enlever
+    # apres coup sans casser les UVs (FloaterRemover convertit trimesh->pymeshlab->trimesh
+    # via .ply intermediaire, ce qui perd les UVs/materials PBR).
+    # Faire le cleanup sur le white_mesh (pas encore texturee, donc pas d'UV a perdre).
     tmp_time = time.time()
-    mesh = face_reduce_worker(mesh)
+    mesh = floater_remove_worker(mesh)
+    mesh = degenerate_face_remove_worker(mesh)
+    logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
+    stats['time']['postprocessing'] = time.time() - tmp_time
 
+    # AMD ROCm low-VRAM: face_reduce_worker pre-texture removed (paint on full-res mesh).
+    # Reason: face reduction (1.19M -> 40k = x30) changed the topology that the
+    # multiview bake then projected onto, losing fine surface detail (folds, lace,
+    # etc). Full-resolution mesh = finer texture projection. Simplification still
+    # available via the Transform button (Target Face Number slider) post-texture
+    # if the user wants a smaller exported GLB.
     # path = export_mesh(mesh, save_folder, textured=False, type='glb')
     path = export_mesh(mesh, save_folder, textured=False, type='obj') # 这样操作也会 core dump
 
-    logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['face reduction'] = time.time() - tmp_time
-
     tmp_time = time.time()
 
-    text_path = os.path.join(save_folder, f'textured_mesh.obj')
-    path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
-        
+    # AMD ROCm texture subprocess pattern:
+    # 1) Release shape pipeline (refcount-safe via _release_torch_memory) avant subprocess
+    #    pour eviter pic RAM transitoire => OOM killer kernel observe en v3.
+    # 2) Texture subprocess (venv 3.11 hardcode pour bpy) via run_texture.py
+    #    --view-preset default = 6 vues full quality. VRAM peak ~10.5 GB sur RX 7900 XT
+    #    grace aux optims subprocess-side (DINO/text_encoder offload, vae_slicing,
+    #    chunked SDPA via HY3D_SDPA_QUERY_CHUNK). Subprocess os._exit(0) garantit
+    #    liberation 100% VRAM avant retour gradio.
+    # 3) Lazy reload shape au prochain _gen_shape() click (cf _ensure_shape_loaded).
+    # 4) TEXTURE_VENV_PYTHON hardcode (pas sys.executable) blinde contre lancement
+    #    accidentel depuis un autre venv (3.10) qui n'a pas bpy.
+    import subprocess as _subprocess
+    glb_path_textured = os.path.join(save_folder, 'textured_mesh.glb')
+
+    # Sauve l'image source en .png temporaire pour la passer au subprocess
+    tmp_image_path = os.path.join(save_folder, 'input_image.png')
+    if hasattr(image, 'save'):
+        image.save(tmp_image_path)
+    elif isinstance(image, str):
+        import shutil as _shutil
+        _shutil.copy(image, tmp_image_path)
+    else:
+        raise RuntimeError(f"Unsupported image type for subprocess texture: {type(image)}")
+
+    # AMD ROCm low-VRAM (post-OOM-reload pattern):
+    # v3 reloadait i23d_worker dans le finally immediatement apres subprocess exit
+    # => pic RAM transitoire (subprocess pages pas encore reclaim par kernel + reload alloc 8 GB)
+    # => OOM killer kernel (gradio a 27 GB RSS au pic).
+    # v4: release total + malloc_trim avant subprocess, et LAZY RELOAD au prochain _gen_shape().
+    # Refcount-safe pattern: clear the global BEFORE cleanup so gc.collect() sees refcount=0.
+    # voie refcount=0 et libere effectivement.
+    print("[AMD-VRAM] releasing shape pipeline (lazy reload at next click)...")
+    old_worker = i23d_worker
+    i23d_worker = None
+    del old_worker
+    _release_torch_memory()
+
+    try:
+        print("[AMD subprocess] launching run_texture.py for VRAM-clean texture gen...")
+        _run_texture_script = os.environ.get(
+            "HY3D_RUN_TEXTURE_SCRIPT",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "amd-rocm-extras", "run_texture.py"),
+        )
+        _subprocess.run([
+            TEXTURE_VENV_PYTHON,
+            _run_texture_script,
+            "--view-preset", "default",  # 6-view full quality; VRAM kept low by subprocess-side ROCm optims
+            "--resolution", "512",
+            path,                       # mesh shape (.obj ok, run_texture.py accepte)
+            tmp_image_path,
+            glb_path_textured,
+        ], check=True)
+        path_textured = glb_path_textured  # subprocess output direct .glb (skip obj2gltf)
+    finally:
+        # AMD ROCm low-VRAM: no immediate reload (transient RAM spike triggers OOM).
+        # Reload sera fait lazy dans _gen_shape() au prochain click.
+        # Re-cleanup post-subprocess pour reclaim eventuelles pages transitoires.
+        _release_torch_memory()
+
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
 
     tmp_time = time.time()
-    # Convert textured OBJ to GLB using obj2gltf with PBR support
-    glb_path_textured = os.path.join(save_folder, 'textured_mesh.glb')
-    conversion_success = quick_convert_with_obj2gltf(path_textured, glb_path_textured)
+    # AMD ROCm low-VRAM: the subprocess already wrote a .glb directly, no obj2gltf conversion needed.
+    # glb_path_textured pointe déjà sur le bon path (assigné plus haut).
+    # conversion_success = quick_convert_with_obj2gltf(path_textured, glb_path_textured)  # SKIPPED
 
-    logger.info("---Convert textured OBJ to GLB takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['convert textured OBJ to GLB'] = time.time() - tmp_time
+    logger.info("---Convert textured OBJ to GLB SKIPPED (subprocess outputs .glb directly)")
+    stats['time']['convert textured OBJ to GLB'] = 0.0
     stats['time']['total'] = time.time() - start_time_0
     model_viewer_html_textured = build_model_viewer_html(save_folder, 
                                                          height=HTML_HEIGHT, 
@@ -777,47 +902,25 @@ if __name__ == '__main__':
 
     SUPPORTED_FORMATS = ['glb', 'obj', 'ply', 'stl']
 
-    HAS_TEXTUREGEN = False
+    # AMD ROCm low-VRAM: do NOT pre-load tex_pipeline in the main process memory.
+    # Le bouton "Gen Textured Shape" délègue à un subprocess Python (run_texture.py) qui
+    # charge, génère, exit (=> VRAM texture libérée). Sans ce patch :
+    #   - shape model loaded : 10 GB
+    #   - + tex_pipeline loaded passive : 15-21 GB
+    #   - = 25-31 GB > 20 GB physique = OOM au démarrage.
+    # Avec subprocess pattern :
+    #   - shape loaded : 10 GB (permanent en main process)
+    #   - subprocess texture spawn quand cliqué : 6-8 GB peak supplémentaire
+    #   - subprocess exit : texture libérée, shape reste pour next gen
+    # Le HAS_TEXTUREGEN reste True pour que le bouton "Gen Textured Shape" soit visible.
     if not args.disable_tex:
-        try:
-            # Apply torchvision fix before importing basicsr/RealESRGAN
-            print("Applying torchvision compatibility fix for texture generation...")
-            try:
-                from torchvision_fix import apply_fix
-                fix_result = apply_fix()
-                if not fix_result:
-                    print("Warning: Torchvision fix may not have been applied successfully")
-            except Exception as fix_error:
-                print(f"Warning: Failed to apply torchvision fix: {fix_error}")
-            
-            # from hy3dgen.texgen import Hunyuan3DPaintPipeline
-            # texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            # if args.low_vram_mode:
-            #     texgen_worker.enable_model_cpu_offload()
-
-            from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-            conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
-            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-            tex_pipeline = Hunyuan3DPaintPipeline(conf)
-        
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
-            
-            HAS_TEXTUREGEN = True
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error loading texture generator: {e}")
-            print("Failed to load texture generator.")
-            print('Please try to install requirements by following README.md')
-            HAS_TEXTUREGEN = False
+        print("[AMD-VRAM] tex_pipeline NOT pre-loaded — subprocess pattern enabled.")
+        print("[AMD-VRAM] 'Gen Textured Shape' click will spawn run_texture.py via subprocess (see HY3D_RUN_TEXTURE_SCRIPT env var to override the path).")
+        HAS_TEXTUREGEN = True
+        tex_pipeline = None
+    else:
+        HAS_TEXTUREGEN = False
+        tex_pipeline = None
 
     HAS_T2I = True
     if args.enable_t23d:
@@ -832,17 +935,8 @@ if __name__ == '__main__':
     from hy3dshape.rembg import BackgroundRemover
 
     rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=False,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
+    # AMD ROCm low-VRAM: factor out the load shape worker (boot + post subprocess texture).
+    i23d_worker = _load_shape_worker(args)
 
     floater_remove_worker = FloaterRemover()
     degenerate_face_remove_worker = DegenerateFaceRemover()
